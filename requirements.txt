@@ -1,0 +1,6 @@
+Flask==1.1.2
+gspread==3.6.0
+psycopg2==2.8.5
+python-dateutil==2.8.1
+tqdm==4.48.2
+viberbot==1.0.11

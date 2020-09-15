@@ -3,14 +3,14 @@ import logging
 import sched
 import threading
 import os
-from decimal import InvalidOperation, Decimal
 from logging.config import dictConfig
-
+from dateutil.parser import parse as dt_parse, ParserError as DateParserError
 
 import click
 from tqdm import tqdm
 import gspread
 from flask import Flask, request, Response, url_for
+from sqlalchemy.sql import and_, func, expression
 
 from viberbot import Api
 from viberbot.api.bot_configuration import BotConfiguration
@@ -42,34 +42,37 @@ dictConfig(app.config["LOGGING"])
 viber = Api(
     BotConfiguration(
         name=app.config["BOT_NAME"],
-        avatar="http://viber.com/avatar.jpg",
+        avatar=f"{app.config['WEBHOOK_URL']}/static/avatar.png",
         auth_token=app.config["BOT_AUTH_TOKEN"],
     )
 )
 
 
 def get_product_stats(region, product_category):
-    prices = []
-    amounts = []
+    ptc = procurements.table.c
 
-    for p in procurements.all(product_name=product_category, region=region):
-        prices.append(Decimal(p["price"]))
-        amounts.append(Decimal(p["total_amount"]))
+    q = db.query(
+        expression.select(
+            [
+                func.count(ptc.total_amount).label("count"),
+                func.sum(ptc.total_amount).label("total"),
+                func.min(ptc.price).label("min"),
+                func.avg(ptc.price).label("avg"),
+                func.max(ptc.price).label("max"),
+            ],
+            whereclause=and_(ptc.product_name == product_category, ptc.region == region)
+        )
+    )
 
-    if prices:
-        return {
-            "count": len(prices),
-            "total": sum(amounts),
-            "max": max(prices),
-            "min": min(prices),
-            "avg": sum(prices) / len(prices),
-        }
-    else:
-        return None
-
+    for r in q:
+        if r["count"] == 0:
+            return None
+        else:
+            return r
 
 @app.cli.command("sync_spreadsheet")
-def sync_spreadsheet():
+@click.option("--purge", default=False, is_flag=True)
+def sync_spreadsheet(purge):
     inserted_count = 0
     updated_count = 0
     invalid_count = 0
@@ -78,6 +81,9 @@ def sync_spreadsheet():
 
     gc = gspread.service_account(os.path.join("keys", app.config["GDRIVE_KEY"]))
     sp = gc.open_by_key(app.config["GDRIVE_SPREADSHEET"])
+
+    if purge:
+        procurements.drop()
     for sheet_num, sheet in enumerate(tqdm(sp.worksheets(), desc="Sheets")):
         try:
             for rec in tqdm(sheet.get_all_records(), desc=f"Records in sheet {sheet_num + 1}"):
@@ -110,14 +116,20 @@ def sync_spreadsheet():
                         elif new_k in ["price", "total_amount"]:
                             try:
                                 refined_rec[new_k] = parse_amount(v)
-                            except InvalidOperation:
-                                app.logger.warning(f"Cannot parse price {v}, skipping rec {rec}")
+                            except ValueError:
+                                app.logger.warning(f"Cannot parse field {new_k} {v}, skipping rec {rec}")
                                 raise InvalidRecord()
                         elif new_k in ["participants"]:
                             try:
                                 refined_rec[new_k] = parse_int(v)
                             except ValueError:
-                                app.logger.warning(f"Cannot parse price {v}, skipping rec {rec}")
+                                app.logger.warning(f"Cannot parse number of participants {v}, skipping rec {rec}")
+                                raise InvalidRecord()
+                        elif new_k in ["signature_date"]:
+                            try:
+                                refined_rec[new_k] = dt_parse(v, dayfirst=True).date()
+                            except DateParserError:
+                                app.logger.warning(f"Cannot parse date of signature {v}, skipping rec {rec}")
                                 raise InvalidRecord()
                         else:
                             refined_rec[new_k] = v
@@ -135,6 +147,9 @@ def sync_spreadsheet():
             useful_sheets += 1
         except InvalidSheet as e:
             invalid_sheets += 1
+
+    if purge:
+        procurements.create_index(["product_name", "region", "signature_date"])
 
     app.logger.info(f"Sheets processed: {useful_sheets}, sheets skipped: {invalid_sheets}")
     app.logger.info(
@@ -215,8 +230,8 @@ def incoming():
                     response = f"Поки що за вашим запитом ”{chunks[2]}” в області ”{chunks[1]}” нічого не знайдено"
                 else:
                     response = (
-                        f"Всього закупівель: {stats['count']} на суму {stats['total']}\nМінімальна ціна: {stats['min']}"
-                        + f"\nМаксимальна ціна: {stats['max']}\nСередня ціна: {stats['avg']}\n"
+                        f"Всього закупівель: {stats['count']} на суму {stats['total']:.2f} грн.\nМінімальна ціна: {stats['min']:.2f} грн."
+                        + f"\nМаксимальна ціна: {stats['max']:.2f} грн.\nСередня ціна: {stats['avg']:.2f} грн.\n"
                         + f"\nЗавантажити файл: {app.config['WEBHOOK_URL']}{url_for('static', filename='export.xlsx')}"  # TODO: real urls
                     )
 
@@ -257,6 +272,4 @@ if __name__ == "__main__":
     t = threading.Thread(target=scheduler.run)
     t.start()
 
-    procurements = db["procurements"]
-
-    app.run(host="0.0.0.0", debug=True)
+    app.run(host="0.0.0.0", debug=app.config["DEBUG"])

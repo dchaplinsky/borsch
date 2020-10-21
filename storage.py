@@ -14,7 +14,6 @@ def get_postgres_database(app, schema=None):
             + f"@{app.config['DB_HOST']}/{app.config['DB_NAME']}"
         )
 
-        print(connection_str)
         _postgres_db = dataset.connect(
             connection_str
         )

@@ -4,8 +4,11 @@ import sched
 import threading
 import os
 from logging.config import dictConfig
-from dateutil.parser import parse as dt_parse, ParserError as DateParserError
+from datetime import datetime
+from collections import OrderedDict
 
+from dateutil.parser import parse as dt_parse, ParserError as DateParserError
+from dateutil.relativedelta import relativedelta
 import click
 from tqdm import tqdm
 import gspread
@@ -14,7 +17,7 @@ from sqlalchemy.sql import and_, func, expression
 
 from viberbot import Api
 from viberbot.api.bot_configuration import BotConfiguration
-from viberbot.api.messages.text_message import TextMessage
+from viberbot.api.messages import TextMessage, RichMediaMessage
 from viberbot.api.viber_requests import (
     ViberConversationStartedRequest,
     ViberFailedRequest,
@@ -48,7 +51,7 @@ viber = Api(
 )
 
 
-def get_product_stats(region, product_category):
+def get_product_stats_since(region, product_category, since):
     ptc = procurements.table.c
 
     q = db.query(
@@ -60,15 +63,37 @@ def get_product_stats(region, product_category):
                 func.avg(ptc.price).label("avg"),
                 func.max(ptc.price).label("max"),
             ],
-            whereclause=and_(ptc.product_name == product_category, ptc.region == region)
+            whereclause=and_(ptc.product_name == product_category, ptc.region == region, ptc.signature_date >= since),
         )
     )
 
     for r in q:
-        if r["count"] == 0:
-            return None
-        else:
+        if r["count"] > 0:
             return r
+
+
+def get_product_stats(region, product_category):
+    now = datetime.now(app.config["TIMEZONE"])
+
+    periods = (
+        ("За останню добу", relativedelta(days=-1)),
+        ("За останній тиждень", relativedelta(days=-7)),
+        ("За останній місяць", relativedelta(months=-1)),
+        ("За весь час", relativedelta(years=-100)),
+    )
+
+    res = []
+    for label, period in periods:
+        r = get_product_stats_since(region, product_category, now + period)
+
+        if r is not None:
+            res.append((label, r))
+
+    if res:
+        return OrderedDict(res)
+    else:
+        return None
+
 
 @app.cli.command("sync_spreadsheet")
 @click.option("--purge", default=False, is_flag=True)
@@ -91,7 +116,13 @@ def sync_spreadsheet(purge):
 
                 try:
                     for k, v in rec.items():
-                        k = k.lower()
+                        k = k.lower().strip()
+                        if isinstance(v, str):
+                            v = v.strip()
+
+                        if not k:
+                            continue
+
                         if k not in HEADERS:
                             app.logger.warning(f"Cannot parse header record {k}, aborting current sheet {sheet}")
                             raise InvalidSheet()
@@ -127,7 +158,7 @@ def sync_spreadsheet(purge):
                                 raise InvalidRecord()
                         elif new_k in ["signature_date"]:
                             try:
-                                refined_rec[new_k] = dt_parse(v, dayfirst=True).date()
+                                refined_rec[new_k] = app.config["TIMEZONE"].localize(dt_parse(v, dayfirst=True))
                             except DateParserError:
                                 app.logger.warning(f"Cannot parse date of signature {v}, skipping rec {rec}")
                                 raise InvalidRecord()
@@ -228,20 +259,63 @@ def incoming():
 
                 if stats is None:
                     response = f"Поки що за вашим запитом ”{chunks[2]}” в області ”{chunks[1]}” нічого не знайдено"
-                else:
-                    response = (
-                        f"Всього закупівель: {stats['count']} на суму {stats['total']:.2f} грн.\nМінімальна ціна: {stats['min']:.2f} грн."
-                        + f"\nМаксимальна ціна: {stats['max']:.2f} грн.\nСередня ціна: {stats['avg']:.2f} грн.\n"
-                        + f"\nЗавантажити файл: {app.config['WEBHOOK_URL']}{url_for('static', filename='export.xlsx')}"  # TODO: real urls
+                    response_message = (
+                        TextMessage(
+                            text=f"{response}\nМожете підписатися на оновлення по цій групі товарів",
+                            keyboard=get_viber_subscribe_kbd(chunks[1], chunks[2]),
+                        ),
                     )
 
-                viber.send_messages(
-                    viber_request.sender.id,
-                    TextMessage(
-                        text=f"{response}\nМожете підписатися на оновлення по цій групі товарів",
+                else:
+                    # response = (
+                    # f"Всього закупівель: {stats['count']} на суму {stats['total']:.2f} грн.\nМінімальна ціна: {stats['min']:.2f} грн."
+                    # + f"\nМаксимальна ціна: {stats['max']:.2f} грн.\nСередня ціна: {stats['avg']:.2f} грн.\n"
+                    # + f"\nЗавантажити файл: {app.config['WEBHOOK_URL']}{url_for('static', filename='export.xlsx')}"  # TODO: real urls
+                    # )
+                    SAMPLE_RICH_MEDIA = {
+                        "ButtonsGroupRows": 5,
+                        "ButtonsGroupColumns": 6,
+                        "BgColor": "#FFFFFF",
+                        "Buttons": [],
+                    }
+
+                    for period, stat in stats.items():
+                        SAMPLE_RICH_MEDIA["Buttons"].append(
+                            {
+                                "ActionBody": f"{app.config['WEBHOOK_URL']}{url_for('static', filename='export.xlsx')}",
+                                "ActionType": "open-url",
+                                "TextVAlign": "top",
+                                "TextHAlign": "left",
+                                "Text": f"<b>{period}</b>"
+                                + f"\n\nВсього закупівель: {stat['count']}\nНа суму: {stat['total']:.2f} грн.\nМінімальна ціна: {stat['min']:.2f} грн."
+                                + f"\nМаксимальна ціна: {stat['max']:.2f} грн.\nСередня ціна: {stat['avg']:.2f} грн.\n",
+                                "Rows": 4,
+                                "Columns": 6,
+                            }
+                        )
+                        SAMPLE_RICH_MEDIA["Buttons"].append(
+                            {
+                                "ActionBody": f"{app.config['WEBHOOK_URL']}{url_for('static', filename='export.xlsx')}",
+                                "ActionType": "open-url",
+                                "TextVAlign": "middle",
+                                "TextHAlign": "middle",
+                                "BgColor": "#aaaaaa",
+                                "Text": "<b>Скачати звіт</b>",
+                                "Rows": 1,
+                                "Columns": 6,
+                            }
+                        )
+
+                    SAMPLE_ALT_TEXT = "upgrade now!"
+
+                    response_message = RichMediaMessage(
+                        rich_media=SAMPLE_RICH_MEDIA,
+                        alt_text=SAMPLE_ALT_TEXT,
+                        min_api_version=2,
                         keyboard=get_viber_subscribe_kbd(chunks[1], chunks[2]),
-                    ),
-                )
+                    )
+
+                viber.send_messages(viber_request.sender.id, response_message)
 
     elif isinstance(viber_request, ViberConversationStartedRequest):
         viber.send_messages(
@@ -273,3 +347,4 @@ if __name__ == "__main__":
     t.start()
 
     app.run(host="0.0.0.0", debug=app.config["DEBUG"])
+    # print(get_product_stats("Київ", "масло вершкове"))

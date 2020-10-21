@@ -1,5 +1,5 @@
 def num_strip(val):
-    return str(val).strip().replace(" ", "").replace(",", ".")
+    return str(val).strip().replace(" ", "").replace(",", ".").replace("\xa0", "")
 
 
 def parse_amount(val):

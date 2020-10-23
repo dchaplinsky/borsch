@@ -39,20 +39,18 @@ def get_viber_categories_kbd(region):
     return {
         "Type": "keyboard",
         "Buttons": [
-            viber_button(f"{v.title()}", f"product_category:{region}:{v}")
+            viber_button(f"{v.title()}", f"product_name:{region}:{v}")
             for v in sorted(list(set(PRODUCT_CATEGORIES.values())))
         ],
     }
 
 
-def get_viber_subscribe_kbd(region, product_category):
+def get_viber_subscribe_kbd(region, product_name):
     return {
         "Type": "keyboard",
         "Buttons": 
-        # [viber_button("Скачати файл", "export"), {"ActionType": "open-url",
-        #     "ActionBody": ""}] + 
         [
-            viber_button(f"{k}", f"subscribe:{region}:{product_category}:{period}")
+            viber_button(f"{k}", f"subscribe:{region}:{product_name}:{period}")
             for k, period in SUBSCRIPTION_TYPES.items()
         ] + [viber_button("Ні, дякую", "start")],
     }

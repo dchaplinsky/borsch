@@ -9,11 +9,17 @@ from collections import OrderedDict
 
 from dateutil.parser import parse as dt_parse, ParserError as DateParserError
 from dateutil.relativedelta import relativedelta
+
 import click
 from tqdm import tqdm
 import gspread
-from flask import Flask, request, Response, url_for
+from flask import Flask, request, Response, url_for, abort
 from sqlalchemy.sql import and_, func, expression
+from openpyxl import Workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
+from openpyxl.writer.excel import save_virtual_workbook
+from translitua import translit
 
 from viberbot import Api
 from viberbot.api.bot_configuration import BotConfiguration
@@ -25,7 +31,6 @@ from viberbot.api.viber_requests import (
     ViberSubscribedRequest,
     ViberUnsubscribedRequest,
 )
-
 from viberbot.api.messages import TextMessage, ContactMessage, PictureMessage, VideoMessage, KeyboardMessage
 
 
@@ -51,7 +56,7 @@ viber = Api(
 )
 
 
-def get_product_stats_since(region, product_category, since):
+def get_product_stats_since(region, product_name, since):
     ptc = procurements.table.c
 
     q = db.query(
@@ -63,7 +68,7 @@ def get_product_stats_since(region, product_category, since):
                 func.avg(ptc.price).label("avg"),
                 func.max(ptc.price).label("max"),
             ],
-            whereclause=and_(ptc.product_name == product_category, ptc.region == region, ptc.signature_date >= since),
+            whereclause=and_(ptc.product_name == product_name, ptc.region == region, ptc.signature_date >= since),
         )
     )
 
@@ -72,7 +77,7 @@ def get_product_stats_since(region, product_category, since):
             return r
 
 
-def get_product_stats(region, product_category):
+def get_product_stats(region, product_name):
     now = datetime.now(app.config["TIMEZONE"])
 
     periods = (
@@ -84,9 +89,10 @@ def get_product_stats(region, product_category):
 
     res = []
     for label, period in periods:
-        r = get_product_stats_since(region, product_category, now + period)
+        r = get_product_stats_since(region, product_name, now + period)
 
         if r is not None:
+            r["since"] = now + period
             res.append((label, r))
 
     if res:
@@ -131,7 +137,7 @@ def sync_spreadsheet(purge):
 
                         if new_k == "product_name":
                             if v.lower() not in PRODUCT_CATEGORIES:
-                                app.logger.warning(f"Cannot parse product_category {v}, skipping rec {rec}")
+                                app.logger.warning(f"Cannot parse product_name {v}, skipping rec {rec}")
                                 raise InvalidRecord()
 
                             refined_rec[new_k] = PRODUCT_CATEGORIES[v.lower()]
@@ -188,9 +194,89 @@ def sync_spreadsheet(purge):
     )
 
 
-@app.route("/export", methods=["GET"])
-def export():
-    return None
+@app.route("/export/<product_name>/<region>/<since>", methods=["GET"])
+def export(product_name, region, since):
+    try:
+        assert product_name in PRODUCT_CATEGORIES.values()
+        assert region in REGIONS.values()
+        dt_since = dt_parse(since)
+    except (AssertionError, DateParserError):
+        abort(403, description="Помилка в параметрах")
+
+    ptc = procurements.table.c
+
+    q = db.query(
+        expression.select(
+            [
+                ptc.contract_id,
+                ptc.signature_date,
+                ptc.buyer,
+                ptc.seller,
+                ptc.total_amount,
+                ptc.participants,
+                ptc.product_name,
+                ptc.product_details,
+                ptc.price,
+                ptc.region,
+            ],
+            whereclause=and_(ptc.product_name == product_name, ptc.region == region, ptc.signature_date >= dt_since),
+        )
+    )
+
+    wb = Workbook()
+    ws = wb.active
+    bold = Font(bold=True)
+    ws.title = "Звіт по закупівлях"
+    header = [
+        "Ідентифікатор договору",
+        "Дата підписання",
+        "Організатор",
+        "Переможець",
+        "Сума договору",
+        "Кількість учасників",
+        "Назва продукту",
+        "Характеристика продутку",
+        "Ціна за кг",
+        "Область та м. київ",
+    ]
+
+    for i, h in enumerate(header):
+        cell = ws.cell(row=1, column=i + 1, value=h)
+        cell.font = bold
+        ws.column_dimensions[get_column_letter(i + 1)].width = len(h) + 3
+
+    ws.freeze_panes = "B2"
+
+    for j, r in enumerate(q):
+        contract_cell = ws.cell(
+            row=j + 2,
+            column=1,
+            value=r["contract_id"],
+        )
+
+        contract_cell.hyperlink = "https://prozorro.gov.ua/tender/{}".format(r["contract_id"][:-3])
+        contract_cell.style = "Hyperlink"
+
+        ws.cell(row=j + 2, column=2, value=r["signature_date"])
+        ws.cell(row=j + 2, column=3, value=r["buyer"])
+        ws.cell(row=j + 2, column=4, value=r["seller"])
+        ws.cell(row=j + 2, column=5, value=r["total_amount"])
+        ws.cell(row=j + 2, column=6, value=r["participants"])
+        ws.cell(row=j + 2, column=7, value=r["product_name"])
+        ws.cell(row=j + 2, column=8, value=r["product_details"])
+        ws.cell(row=j + 2, column=9, value=r["price"])
+        ws.cell(row=j + 2, column=10, value=r["region"])
+
+    return Response(
+        save_virtual_workbook(wb),
+        headers={
+            "Content-Disposition":
+            f"attachment; filename=report_{translit(region).lower()}_{translit(product_name).replace(' ', '_')}.xlsx",
+            "Content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        },
+    )
+
+    return Response("Everything is ok")
 
 
 @app.route("/", methods=["POST"])
@@ -248,7 +334,7 @@ def incoming():
                     viber_request.sender.id,
                     TextMessage(text="Вибачте, не зрозумів, оберіть, будь ласка, область", keyboard=VIBER_REGIONS_KBD),
                 )
-        elif command == "product_category":
+        elif command == "product_name":
             if len(chunks) < 3 or chunks[1] not in REGIONS.values() or chunks[2] not in PRODUCT_CATEGORIES.values():
                 viber.send_messages(
                     viber_request.sender.id,
@@ -267,12 +353,7 @@ def incoming():
                     )
 
                 else:
-                    # response = (
-                    # f"Всього закупівель: {stats['count']} на суму {stats['total']:.2f} грн.\nМінімальна ціна: {stats['min']:.2f} грн."
-                    # + f"\nМаксимальна ціна: {stats['max']:.2f} грн.\nСередня ціна: {stats['avg']:.2f} грн.\n"
-                    # + f"\nЗавантажити файл: {app.config['WEBHOOK_URL']}{url_for('static', filename='export.xlsx')}"  # TODO: real urls
-                    # )
-                    SAMPLE_RICH_MEDIA = {
+                    carousel = {
                         "ButtonsGroupRows": 5,
                         "ButtonsGroupColumns": 6,
                         "BgColor": "#FFFFFF",
@@ -280,9 +361,12 @@ def incoming():
                     }
 
                     for period, stat in stats.items():
-                        SAMPLE_RICH_MEDIA["Buttons"].append(
+                        report_url = app.config["WEBHOOK_URL"] + url_for(
+                            "export", region=chunks[1], product_name=chunks[2], since=stat["since"]
+                        )
+                        carousel["Buttons"].append(
                             {
-                                "ActionBody": f"{app.config['WEBHOOK_URL']}{url_for('static', filename='export.xlsx')}",
+                                "ActionBody": report_url,
                                 "ActionType": "open-url",
                                 "TextVAlign": "top",
                                 "TextHAlign": "left",
@@ -293,9 +377,9 @@ def incoming():
                                 "Columns": 6,
                             }
                         )
-                        SAMPLE_RICH_MEDIA["Buttons"].append(
+                        carousel["Buttons"].append(
                             {
-                                "ActionBody": f"{app.config['WEBHOOK_URL']}{url_for('static', filename='export.xlsx')}",
+                                "ActionBody": report_url,
                                 "ActionType": "open-url",
                                 "TextVAlign": "middle",
                                 "TextHAlign": "middle",
@@ -306,11 +390,9 @@ def incoming():
                             }
                         )
 
-                    SAMPLE_ALT_TEXT = "upgrade now!"
-
                     response_message = RichMediaMessage(
-                        rich_media=SAMPLE_RICH_MEDIA,
-                        alt_text=SAMPLE_ALT_TEXT,
+                        rich_media=carousel,
+                        alt_text="Ваш viber-клієнт дуже застарів, будь ласка, оновить його",
                         min_api_version=2,
                         keyboard=get_viber_subscribe_kbd(chunks[1], chunks[2]),
                     )

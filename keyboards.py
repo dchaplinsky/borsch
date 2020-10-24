@@ -48,9 +48,13 @@ def get_viber_categories_kbd(region):
 def get_viber_subscribe_kbd(region, product_name):
     return {
         "Type": "keyboard",
-        "Buttons": 
-        [
+        "Buttons": [
             viber_button(f"{k}", f"subscribe:{region}:{product_name}:{period}")
             for k, period in SUBSCRIPTION_TYPES.items()
-        ] + [viber_button("Ні, дякую", "start")],
+        ]
+        + [
+            viber_button("Ні, дякую", "start"),
+            viber_button("Допомога", "help"),
+            viber_button("Ваші підписки", "subscriptions"),
+        ],
     }

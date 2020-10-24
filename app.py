@@ -6,6 +6,7 @@ import os
 from logging.config import dictConfig
 from datetime import datetime
 from collections import OrderedDict
+from uuid import uuid4
 
 from dateutil.parser import parse as dt_parse, ParserError as DateParserError
 from dateutil.relativedelta import relativedelta
@@ -36,7 +37,7 @@ from viberbot.api.messages import TextMessage, ContactMessage, PictureMessage, V
 
 from exc import InvalidSheet, InvalidRecord
 from storage import get_postgres_database
-from dicts import REGIONS, PRODUCT_CATEGORIES, HEADERS
+from dicts import REGIONS, PRODUCT_CATEGORIES, HEADERS, SUBSCRIPTION_TYPES
 from keyboards import VIBER_MENU_KBD, VIBER_REGIONS_KBD, get_viber_categories_kbd, get_viber_subscribe_kbd
 from utils import parse_amount, parse_int
 
@@ -45,6 +46,7 @@ app = Flask(__name__)
 app.config.from_object("default_settings")
 db = get_postgres_database(app)
 procurements = db["procurements"]
+subscriptions = db["subscriptions"]
 dictConfig(app.config["LOGGING"])
 
 viber = Api(
@@ -99,6 +101,25 @@ def get_product_stats(region, product_name):
         return OrderedDict(res)
     else:
         return None
+
+
+def subscribe_user(user_id, region, product_name, period):
+    updated = subscriptions.upsert(
+        {"user_id": user_id, "region": region, "product_name": product_name, "period": period, "uuid": str(uuid4())},
+        ["user_id", "region", "product_name", "period"],
+    )
+
+    if updated == True:
+        return False
+    return True
+
+
+def get_active_subscriptions(user_id):
+    return list(subscriptions.find(user_id=user_id))
+
+
+def unsubscribe(user_id, uuid):
+    return subscriptions.delete(user_id=user_id, uuid=uuid)
 
 
 @app.cli.command("sync_spreadsheet")
@@ -203,24 +224,8 @@ def export(product_name, region, since):
     except (AssertionError, DateParserError):
         abort(403, description="Помилка в параметрах")
 
-    ptc = procurements.table.c
-
-    q = db.query(
-        expression.select(
-            [
-                ptc.contract_id,
-                ptc.signature_date,
-                ptc.buyer,
-                ptc.seller,
-                ptc.total_amount,
-                ptc.participants,
-                ptc.product_name,
-                ptc.product_details,
-                ptc.price,
-                ptc.region,
-            ],
-            whereclause=and_(ptc.product_name == product_name, ptc.region == region, ptc.signature_date >= dt_since),
-        )
+    q = procurements.find(
+        product_name=product_name, region=region, signature_date={">=": dt_since}, order_by="-signature_date"
     )
 
     wb = Workbook()
@@ -270,8 +275,7 @@ def export(product_name, region, since):
     return Response(
         save_virtual_workbook(wb),
         headers={
-            "Content-Disposition":
-            f"attachment; filename=report_{translit(region).lower()}_{translit(product_name).replace(' ', '_')}.xlsx",
+            "Content-Disposition": f"attachment; filename=report_{translit(region).lower()}_{translit(product_name).replace(' ', '_')}.xlsx",
             "Content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         },
     )
@@ -311,18 +315,96 @@ def incoming():
                 ),
             )
         elif command == "subscriptions":
-            viber.send_messages(
-                viber_request.sender.id,
-                TextMessage(text="У вас поки що нема активних підписок", keyboard=VIBER_MENU_KBD),
-            )
-        elif command == "subscribe":
-            viber.send_messages(
-                viber_request.sender.id,
-                TextMessage(
-                    text=f"Дякую, ви успішно підписані на оновлення по категорії ”{chunks[2]}” в області ”{chunks[1]}”",
+            subs = get_active_subscriptions(viber_request.sender.id)
+
+            if subs:
+                carousel = {
+                    "ButtonsGroupRows": 5,
+                    "ButtonsGroupColumns": 6,
+                    "BgColor": "#FFFFFF",
+                    "Buttons": [],
+                }
+
+                for sub in subs:
+                    period = ""
+                    for p_readable, p in SUBSCRIPTION_TYPES.items():
+                        if sub["period"] == p:
+                            period = p_readable
+                            break
+
+                    carousel["Buttons"].append(
+                        {
+                            "ActionBody": f"product_name:{sub['region']}:{sub['product_name']}",
+                            "ActionType": "reply",
+                            "TextVAlign": "top",
+                            "TextHAlign": "left",
+                            "Text": f"<b>Категорія</b>: {sub['product_name']}\n<b>Регіон</b>: {sub['region']}\n\n{period}",
+                            "Rows": 4,
+                            "Columns": 6,
+                        }
+                    )
+                    carousel["Buttons"].append(
+                        {
+                            "ActionBody": f"unsubscribe:{sub['uuid']}",
+                            "ActionType": "reply",
+                            "TextVAlign": "middle",
+                            "TextHAlign": "middle",
+                            "BgColor": "#ff0000",
+                            "Text": '<font color="#FFFFFF"><b>Відписатись</b></font>',
+                            "Rows": 1,
+                            "Columns": 6,
+                        }
+                    )
+
+                response_message = RichMediaMessage(
+                    rich_media=carousel,
+                    alt_text="Ваш viber-клієнт дуже застарів, будь ласка, оновить його",
+                    min_api_version=2,
                     keyboard=VIBER_MENU_KBD,
-                ),
-            )
+                )
+            else:
+                response_message = TextMessage(text="У вас поки що нема активних підписок", keyboard=VIBER_MENU_KBD)
+
+            viber.send_messages(viber_request.sender.id, response_message)
+        elif command == "unsubscribe":
+            if unsubscribe(viber_request.sender.id, chunks[1]):
+                response_message = TextMessage(text="Ви були успішно відписані", keyboard=VIBER_MENU_KBD)
+            else:
+                response_message = TextMessage(text="Виникла помилка", keyboard=VIBER_MENU_KBD)
+            viber.send_messages(viber_request.sender.id, response_message)
+        elif command == "subscribe":
+            if (
+                len(chunks) < 4
+                or chunks[1] not in REGIONS.values()
+                or chunks[2] not in PRODUCT_CATEGORIES.values()
+                or chunks[3] not in SUBSCRIPTION_TYPES.values()
+            ):
+                viber.send_messages(
+                    viber_request.sender.id,
+                    TextMessage(
+                        text="Вибачте, не зрозумів, спробуйте почати з початку або подивитися довідку",
+                        keyboard=VIBER_MENU_KBD,
+                    ),
+                )
+
+            if subscribe_user(
+                user_id=viber_request.sender.id, region=chunks[1], product_name=chunks[2], period=chunks[3]
+            ):
+                viber.send_messages(
+                    viber_request.sender.id,
+                    TextMessage(
+                        text=f"Дякую, ви успішно підписані на оновлення по категорії ”{chunks[2]}” в області ”{chunks[1]}”",
+                        keyboard=VIBER_MENU_KBD,
+                    ),
+                )
+            else:
+                viber.send_messages(
+                    viber_request.sender.id,
+                    TextMessage(
+                        text=f"Ви вже підписані на оновлення по категорії ”{chunks[2]}” в області ”{chunks[1]}”. Ви можете подивитися активні підписки у розділі ”Ваші підписки”",
+                        keyboard=VIBER_MENU_KBD,
+                    ),
+                )
         elif command == "region":
             if len(chunks) > 1 and chunks[1] in REGIONS.values():
                 viber.send_messages(
@@ -344,12 +426,9 @@ def incoming():
                 stats = get_product_stats(chunks[1], chunks[2])
 
                 if stats is None:
-                    response = f"Поки що за вашим запитом ”{chunks[2]}” в області ”{chunks[1]}” нічого не знайдено"
-                    response_message = (
-                        TextMessage(
-                            text=f"{response}\nМожете підписатися на оновлення по цій групі товарів",
-                            keyboard=get_viber_subscribe_kbd(chunks[1], chunks[2]),
-                        ),
+                    response_message = TextMessage(
+                        text=f"Поки що за вашим запитом ”{chunks[2]}” в області ”{chunks[1]}” нічого не знайдено",
+                        keyboard=get_viber_subscribe_kbd(chunks[1], chunks[2]),
                     )
 
                 else:
@@ -394,10 +473,18 @@ def incoming():
                         rich_media=carousel,
                         alt_text="Ваш viber-клієнт дуже застарів, будь ласка, оновить його",
                         min_api_version=2,
-                        keyboard=get_viber_subscribe_kbd(chunks[1], chunks[2]),
                     )
 
-                viber.send_messages(viber_request.sender.id, response_message)
+                viber.send_messages(
+                    viber_request.sender.id,
+                    [
+                        response_message,
+                        TextMessage(
+                            text="Ви можете підписатий на оновлення по цій категорії товарів:",
+                            keyboard=get_viber_subscribe_kbd(chunks[1], chunks[2]),
+                        ),
+                    ],
+                )
 
     elif isinstance(viber_request, ViberConversationStartedRequest):
         viber.send_messages(

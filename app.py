@@ -47,6 +47,7 @@ app.config.from_object("default_settings")
 db = get_postgres_database(app)
 procurements = db["procurements"]
 subscriptions = db["subscriptions"]
+sent_log = db["sent_log"]
 dictConfig(app.config["LOGGING"])
 
 viber = Api(
@@ -105,7 +106,14 @@ def get_product_stats(region, product_name):
 
 def subscribe_user(user_id, region, product_name, period):
     updated = subscriptions.upsert(
-        {"user_id": user_id, "region": region, "product_name": product_name, "period": period, "uuid": str(uuid4())},
+        {
+            "user_id": user_id,
+            "region": region,
+            "product_name": product_name,
+            "period": period,
+            "uuid": str(uuid4()),
+            "dt": datetime.now(app.config["TIMEZONE"]),
+        },
         ["user_id", "region", "product_name", "period"],
     )
 
@@ -504,8 +512,95 @@ def incoming():
     return Response(status=200)
 
 
-if __name__ == "__main__":
+@app.cli.command("send_subscriptions")
+def send_subscriptions():
+    now = datetime.now(app.config["TIMEZONE"])
 
+    periods = ["daily"]
+    if now.date().weekday == 1:
+        periods.append("weekly")
+    if now.day == 27:
+        periods.append("monthly")
+
+    offsets = {"daily": relativedelta(days=-1), "weekly": relativedelta(days=-7), "monthly": relativedelta(months=-1)}
+
+    first_insert = True
+
+    for period in periods:
+        sent_stats = 0
+        since = now + offsets[period]
+        for sub in subscriptions.find(period=period):
+            if sent_log.find_one(subscription_id=sub["id"], dt=now.date()):
+                app.logger.info(f"Skipping subscription {sub['id']} as it was already processed today ({now.date()})")
+                continue
+
+            try:
+                stat = get_product_stats_since(sub["region"], sub["product_name"], since)
+
+                carousel = {
+                    "ButtonsGroupRows": 5,
+                    "ButtonsGroupColumns": 6,
+                    "BgColor": "#FFFFFF",
+                    "Buttons": [],
+                }
+
+                report_url = url_for(
+                    "export", region=sub["region"], product_name=sub["product_name"], since=since
+                )
+                carousel["Buttons"].append(
+                    {
+                        "ActionBody": report_url,
+                        "ActionType": "open-url",
+                        "TextVAlign": "top",
+                        "TextHAlign": "left",
+                        "Text": f"<b>Ваша підписка на ”{sub['product_name']}” в області ”{sub['region']}”</b>"
+                        + f"\n\nВсього закупівель: {stat['count']}\nНа суму: {stat['total']:.2f} грн.\nМінімальна ціна: {stat['min']:.2f} грн."
+                        + f"\nМаксимальна ціна: {stat['max']:.2f} грн.\nСередня ціна: {stat['avg']:.2f} грн.\n"
+                        + "Звіт за: {}-{}".format(since.strftime(app.config["DT_FORMAT"]), now.strftime(app.config["DT_FORMAT"])),
+                        "Rows": 4,
+                        "Columns": 6,
+                    }
+                )
+                carousel["Buttons"].append(
+                    {
+                        "ActionBody": report_url,
+                        "ActionType": "open-url",
+                        "TextVAlign": "middle",
+                        "TextHAlign": "middle",
+                        "BgColor": "#aaaaaa",
+                        "Text": "<b>Скачати звіт</b>",
+                        "Rows": 1,
+                        "Columns": 6,
+                    }
+                )
+
+                viber.send_messages(
+                    sub["user_id"],
+                    [
+                        RichMediaMessage(
+                            rich_media=carousel,
+                            alt_text="Ваш viber-клієнт дуже застарів, будь ласка, оновить його",
+                            min_api_version=2,
+                            keyboard=VIBER_MENU_KBD,
+                        )
+                    ],
+                )
+                sent_log.insert({"subscription_id": sub["id"], "dt": now.date(), "status": "ok"})
+                sent_stats += 1
+            except Exception as e:
+                sent_log.insert({"subscription_id": sub["id"], "dt": now.date(), "status": "fail"})
+                app.logger.error(f"Subscription {sub['id']} raised an error '{e}'")
+                raise
+
+            if first_insert:
+                sent_log.create_index(["subscription_id", "dt"])
+
+            first_insert = False
+
+        app.logger.info(f"{sent_stats} has been sent successfuly for period {period}")
+
+
+if __name__ == "__main__":
     def set_webhook(viber):
         app.logger.info("Setting webhook")
         viber.set_webhook(app.config["WEBHOOK_URL"])
@@ -516,4 +611,3 @@ if __name__ == "__main__":
     t.start()
 
     app.run(host="0.0.0.0", debug=app.config["DEBUG"])
-    # print(get_product_stats("Київ", "масло вершкове"))

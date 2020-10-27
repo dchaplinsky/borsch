@@ -517,9 +517,9 @@ def send_subscriptions():
     now = datetime.now(app.config["TIMEZONE"])
 
     periods = ["daily"]
-    if now.date().weekday == 1:
+    if now.date().weekday == 0:
         periods.append("weekly")
-    if now.day == 27:
+    if now.day == 1:
         periods.append("monthly")
 
     offsets = {"daily": relativedelta(days=-1), "weekly": relativedelta(days=-7), "monthly": relativedelta(months=-1)}

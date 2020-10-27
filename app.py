@@ -536,6 +536,9 @@ def send_subscriptions():
 
             try:
                 stat = get_product_stats_since(sub["region"], sub["product_name"], since)
+                if stat is None:
+                    app.logger.info(f"No stats available for {sub['region']}/{sub['product_name']} since {since}")
+                    continue
 
                 carousel = {
                     "ButtonsGroupRows": 5,
@@ -590,7 +593,6 @@ def send_subscriptions():
             except Exception as e:
                 sent_log.insert({"subscription_id": sub["id"], "dt": now.date(), "status": "fail"})
                 app.logger.error(f"Subscription {sub['id']} raised an error '{e}'")
-                raise
 
             if first_insert:
                 sent_log.create_index(["subscription_id", "dt"])

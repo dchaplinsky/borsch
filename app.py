@@ -14,7 +14,7 @@ from dateutil.relativedelta import relativedelta
 import click
 from tqdm import tqdm
 import gspread
-from flask import Flask, request, Response, url_for, abort
+from flask import Flask, request, Response, url_for, abort, redirect
 from sqlalchemy.sql import and_, func, expression
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -221,6 +221,11 @@ def sync_spreadsheet(purge):
     app.logger.info(
         f"Records added: {inserted_count}, records updated: {updated_count}, records skipped: {invalid_count}"
     )
+
+
+@app.route("/start", methods=["GET"])
+def start():
+    return redirect(app.config["VIBER_DEEPLINK"])
 
 
 @app.route("/export/<product_name>/<region>/<since>", methods=["GET"])
